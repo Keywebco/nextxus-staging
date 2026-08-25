@@ -15,7 +15,7 @@
   // ============================================================
   const FED_CONFIG = {
     geminiEndpoint: '/api/gemini',
-    googleClientId: null, // Set via FED_GOOGLE_CLIENT_ID global or data attribute
+    googleClientId: '134917241648-9goc8mcat23m1qkts62ujnq723a81n2v.apps.googleusercontent.com', // Injected OAuth Client ID
     isThrone: false,      // Set true on nextxus.tech admin pages
     siteName: document.title || 'NextXus',
   };
