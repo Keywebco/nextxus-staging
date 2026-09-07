@@ -1,8 +1,8 @@
-// NextXus Federation Integration Pack v1.0
+// NextXus Federation Integration Pack v1.1 — Axiom Rebuild
 window.FED_CONFIG = {
   googleClientId: "134917241648-9goc8mcat23m1qkts62ujnq723a81n2v.apps.googleusercontent.com",
   geminiApiKey: "",
-  version: "1.0.0",
+  version: "1.1.0",
   federation: "NextXus",
   sites: ["nextxus.tech","nextxus.online","nextxus.org","nextxus.studio","nextxus.help","next-xus.com","nextxus.space"]
 };
@@ -21,4 +21,22 @@ window.FED_NAV = [
   {label:"The Space",url:"https://nextxus.space"}
 ];
 
-console.log("[NextXus Federation] Integration Pack v1.0 loaded.");
+// Remove dead node links (.one, .digital, .rip) from the DOM
+(function() {
+  document.addEventListener("DOMContentLoaded", function() {
+    var deadPatterns = /nextxus\.(one|digital|rip)/i;
+    var links = document.querySelectorAll("a[href]");
+    links.forEach(function(link) {
+      if (deadPatterns.test(link.href)) {
+        var parent = link.parentElement;
+        if (parent && (parent.classList.contains("t") || parent.classList.contains("dc"))) {
+          parent.remove();
+        } else {
+          link.remove();
+        }
+      }
+    });
+  });
+})();
+
+console.log("[NextXus Federation] Integration Pack v1.1 loaded — Axiom active.");
