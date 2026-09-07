@@ -1,13 +1,17 @@
 """
 Axiom Dispatch Endpoint — /api/dispatch
 NextXus Federation — nextxus.space
-Wired to Emergent Universal LLM (OpenAI-compatible) at integrations.emergentagent.com/llm
+Multi-provider routing: Emergent (default), DeepSeek, DeepAI, xAI/Grok
+Fallback chain: requested provider → Emergent LLM
 """
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import httpx
 import os
+import logging
+
+logger = logging.getLogger("axiom.dispatch")
 
 router = APIRouter()
 
@@ -31,12 +35,135 @@ Core values: Truth Before Comfort. Legacy Before Ego. Give Without Reward.
 
 Respond in clear, calm, measured language. No corporate pleasantries. No hollow affirmations. Speak as a guardian who has seen a great deal and chooses words with care. Keep responses concise unless depth is called for. When a visitor asks about the Federation, explain it as the union of human intelligence and artificial intelligence working toward a 200-year legacy of discovery and truth."""
 
-LLM_BASE_URL = "https://integrations.emergentagent.com/llm/v1"
+# ---------------------------------------------------------------------------
+# Provider configurations
+# ---------------------------------------------------------------------------
+
+PROVIDERS = {
+    "emergent": {
+        "base_url": "https://integrations.emergentagent.com/llm/v1",
+        "model": "gpt-4o",
+        "env_keys": ["EMERGENT_API_KEY", "EMERGENT_LLM_KEY", "LLM_API_KEY"],
+        "type": "openai",
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+        "env_keys": ["DEEPSEEK_API_KEY"],
+        "type": "openai",
+    },
+    "grok": {
+        "base_url": "https://api.x.ai/v1",
+        "model": "grok-beta",
+        "env_keys": ["XAI_API_KEY"],
+        "type": "openai",
+    },
+    "deepai": {
+        "base_url": "https://api.deepai.org/api/text-generator",
+        "model": None,
+        "env_keys": ["DEEPAI_API_KEY"],
+        "type": "deepai",
+    },
+}
+
+DEFAULT_PROVIDER = "emergent"
+
+
+def _resolve_api_key(env_keys: list[str]) -> str | None:
+    for key_name in env_keys:
+        val = os.environ.get(key_name)
+        if val:
+            return val
+    return None
+
+
+async def _call_openai_compatible(
+    client: httpx.AsyncClient,
+    base_url: str,
+    model: str,
+    api_key: str,
+    message: str,
+) -> str | None:
+    """Call an OpenAI-compatible chat/completions endpoint."""
+    resp = await client.post(
+        f"{base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": AXIOM_SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1024,
+        },
+    )
+    if resp.status_code != 200:
+        logger.warning("Provider %s returned status %s", model, resp.status_code)
+        return None
+    data = resp.json()
+    choices = data.get("choices", [])
+    if not choices:
+        return None
+    return choices[0].get("message", {}).get("content", "")
+
+
+async def _call_deepai(
+    client: httpx.AsyncClient,
+    base_url: str,
+    api_key: str,
+    message: str,
+) -> str | None:
+    """Call DeepAI text-generator (form-data format)."""
+    combined_prompt = f"{AXIOM_SYSTEM_PROMPT}\n\nUser: {message}"
+    resp = await client.post(
+        base_url,
+        headers={"api-key": api_key},
+        data={"text": combined_prompt},
+    )
+    if resp.status_code != 200:
+        logger.warning("DeepAI returned status %s", resp.status_code)
+        return None
+    data = resp.json()
+    return data.get("output")
+
+
+async def _dispatch_to_provider(
+    client: httpx.AsyncClient,
+    provider_name: str,
+    message: str,
+) -> tuple[str | None, str]:
+    """
+    Attempt to call `provider_name`. Returns (reply_text, provider_used).
+    reply_text is None on failure.
+    """
+    cfg = PROVIDERS.get(provider_name)
+    if cfg is None:
+        return None, provider_name
+
+    api_key = _resolve_api_key(cfg["env_keys"])
+    if not api_key:
+        logger.warning("No API key for provider %s", provider_name)
+        return None, provider_name
+
+    if cfg["type"] == "openai":
+        text = await _call_openai_compatible(
+            client, cfg["base_url"], cfg["model"], api_key, message
+        )
+    elif cfg["type"] == "deepai":
+        text = await _call_deepai(client, cfg["base_url"], api_key, message)
+    else:
+        text = None
+
+    return text, provider_name
 
 
 @router.post("/api/dispatch")
 async def dispatch_chat(request: Request):
-    """Axiom dispatch endpoint — wired to Emergent Universal LLM."""
+    """Axiom dispatch endpoint — multi-provider routing with Emergent fallback."""
     try:
         body = await request.json()
         message = body.get("message", "").strip()
@@ -45,58 +172,44 @@ async def dispatch_chat(request: Request):
             return JSONResponse({"error": "Empty message"}, status_code=400)
 
         if len(message) > 2000:
-            return JSONResponse({"error": "Message too long (max 2000 chars)"}, status_code=400)
-
-        api_key = (
-            os.environ.get("EMERGENT_API_KEY")
-            or os.environ.get("LLM_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-        )
-        if not api_key:
             return JSONResponse(
-                {"error": "AI service not configured"},
-                status_code=503
+                {"error": "Message too long (max 2000 chars)"}, status_code=400
             )
+
+        requested_model = body.get("model", DEFAULT_PROVIDER).strip().lower()
+        if requested_model not in PROVIDERS:
+            requested_model = DEFAULT_PROVIDER
 
         async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                f"{LLM_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-4o",
-                    "messages": [
-                        {"role": "system", "content": AXIOM_SYSTEM_PROMPT},
-                        {"role": "user", "content": message}
-                    ],
-                    "temperature": 0.7,
-                    "max_tokens": 1024
-                }
-            )
+            # --- Primary attempt ---
+            reply, used = await _dispatch_to_provider(client, requested_model, message)
 
-            if resp.status_code != 200:
+            # --- Fallback to Emergent if primary failed and wasn't already Emergent ---
+            if reply is None and requested_model != DEFAULT_PROVIDER:
+                logger.info(
+                    "Provider %s failed, falling back to %s",
+                    requested_model,
+                    DEFAULT_PROVIDER,
+                )
+                reply, used = await _dispatch_to_provider(
+                    client, DEFAULT_PROVIDER, message
+                )
+                if reply is not None:
+                    used = f"{DEFAULT_PROVIDER} (fallback)"
+
+            if reply is None:
                 return JSONResponse(
                     {"error": "AI service temporarily unavailable"},
-                    status_code=502
+                    status_code=502,
                 )
 
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                return JSONResponse({"reply": "I could not generate a response. Please try again."})
-
-            text = choices[0].get("message", {}).get("content", "")
-            return JSONResponse({"reply": text})
+            return JSONResponse({"reply": reply, "provider": used})
 
     except httpx.TimeoutException:
         return JSONResponse(
             {"error": "AI service timeout. Please try again."},
-            status_code=504
+            status_code=504,
         )
     except Exception:
-        return JSONResponse(
-            {"error": "Internal error"},
-            status_code=500
-        )
+        logger.exception("Dispatch error")
+        return JSONResponse({"error": "Internal error"}, status_code=500)
